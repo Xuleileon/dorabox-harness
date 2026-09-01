@@ -8,6 +8,7 @@ from . import _ipc as ipc
 from . import auth
 from . import paths
 from cdp_use.client import CDPClient
+from .dorabox_backend import DoraBoxCDPClient, browser_kind as resolve_browser_kind
 
 
 def _load_env():
@@ -88,7 +89,7 @@ INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension
 BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
 _REMOTE_STOPPED = False
-BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")) else "local")
+BROWSER_KIND = resolve_browser_kind()
 # Chrome 144+ shows a per-connection popup. Keep popup open enough to click.
 LOCAL_HANDSHAKE_TIMEOUT = 45
 # How long get_ws_url() keeps waiting for DevToolsActivePort before giving up
@@ -403,6 +404,34 @@ class Daemon:
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
 
+
+    async def adopt_dorabox_handoff(self, handoff_id=None):
+        if not hasattr(self.cdp, "claim_handoff"):
+            raise RuntimeError(
+                "The running Browser Harness daemon is not using the DoraBox backend. "
+                "Restart it with BH_BROWSER_BACKEND=dorabox."
+            )
+        record = await self.cdp.claim_handoff(handoff_id)
+        target_id = record.get("page")
+        if not target_id:
+            raise RuntimeError("DoraBox handoff did not include a page target")
+
+        old_session = self.session
+        self.target_id = target_id
+        new_session = (await self.cdp.send_raw(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+        ))["sessionId"]
+        self.session = new_session
+        self._record_session_replacement(old_session, new_session)
+        await self._enable_default_domains(new_session)
+        return {
+            "handoff": record,
+            "target_id": target_id,
+            "session_id": new_session,
+            "safety": record.get("safety"),
+        }
+
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
         targets = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
@@ -576,15 +605,21 @@ class Daemon:
 
     async def start(self):
         self.stop = asyncio.Event()
-        url = get_ws_url()
-        log(f"connecting to {_safe_connection_label(url)}")
-        self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
-        if BROWSER_KIND == "local":
-            # Allow while this handshake is still parked on the popup
-            log("handshake-wait: if Chrome shows an 'Allow remote debugging?' popup, click Allow")
+        if BROWSER_KIND == "dorabox":
+            log("connecting through DoraBox Browser Bridge")
+            self.cdp = DoraBoxCDPClient(NAME)
+        else:
+            url = get_ws_url()
+            log(f"connecting to {_safe_connection_label(url)}")
+            self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
+            if BROWSER_KIND == "local":
+                # Allow while this handshake is still parked on the popup
+                log("handshake-wait: if Chrome shows an 'Allow remote debugging?' popup, click Allow")
         try:
             await self.cdp.start()
         except Exception as e:
+            if BROWSER_KIND == "dorabox":
+                raise RuntimeError(f"DoraBox browser backend failed: {e}")
             if os.environ.get("BU_CDP_WS"):
                 raise RuntimeError(
                     f"CDP WS handshake failed: {e} -- remote browser WebSocket connection failed. "
@@ -597,6 +632,9 @@ class Daemon:
                     " -- wait for the user to click Allow, then retry"
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
+        claimed_target = getattr(self.cdp, "claimed_target_id", None)
+        if claimed_target:
+            self.target_id = claimed_target
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
@@ -625,6 +663,9 @@ class Daemon:
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
         if meta == "drain_events":
+            poll_events = getattr(self.cdp, "poll_events", None)
+            if poll_events is not None:
+                await poll_events()
             out = list(self.events); self.events.clear()
             return {"events": out}
         if meta == "session":     return {"session_id": self.session}
@@ -692,7 +733,25 @@ class Daemon:
                 timeout=2,
             )))
             return {"session_id": new_session}
-        if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "pending_dialog":
+            poll_events = getattr(self.cdp, "poll_events", None)
+            if poll_events is not None:
+                await poll_events()
+            return {"dialog": self.dialog}
+        if meta == "dorabox_handoff":
+            try:
+                return await self.adopt_dorabox_handoff(req.get("handoff_id"))
+            except Exception as e:
+                return {"error": str(e)}
+        if meta == "dorabox_handoff_release":
+            release = getattr(self.cdp, "release_handoff", None)
+            if release is None:
+                return {"error": "running daemon is not using the DoraBox backend"}
+            try:
+                await release()
+                return {"ok": True}
+            except Exception as e:
+                return {"error": str(e)}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
             # cancel/drain existing handlers. In particular, a CDP replay that
@@ -816,6 +875,15 @@ async def serve(d):
                             log(f"close dedicated tab on shutdown: {e}")
         else:
             log("skip dedicated-tab cleanup: stale-session recovery did not stop")
+        if d.cdp:
+            stop_client = getattr(d.cdp, "stop", None)
+            if stop_client is not None:
+                try:
+                    maybe_awaitable = stop_client()
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
+                except Exception as e:
+                    log(f"stop browser client on shutdown: {e}")
         ipc.cleanup_endpoint(NAME)
 
 

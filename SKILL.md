@@ -15,8 +15,34 @@ Domain skills are off by default. Set `BH_DOMAIN_SKILLS=1` to enable them; see t
 
 **If `BH_DOMAIN_SKILLS=1` and the task is site-specific, read every file in the matching `$BH_AGENT_WORKSPACE/domain-skills/<site>/` directory before inventing an approach.**
 
-## Usage
+## DoraBox fast path and seamless handoff
 
+When DoraBox is installed, treat its deterministic tools as an optional fast
+path — never as a capability ceiling:
+
+1. Before browser work, use the connected MCP client's tool search to look for
+   an **exact** DoraBox operation. With CLI-only clients, inspect
+   `dorabox --help -f json` and then the relevant site's structured help.
+2. Use a DoraBox tool only when its name/schema clearly matches the requested
+   operation. Do not substitute an approximate tool merely to avoid browsing.
+3. If no exact tool exists, continue with normal Browser Harness immediately.
+4. If a DoraBox error includes `handoff`, adopt the preserved failed page:
+   `adopt_dorabox_handoff("<handoff.id>")`. Do **not** open a new tab, navigate
+   back to the site, or repeat completed setup steps.
+5. Read the returned `safety` before acting:
+   - `continue`: inspect the current page and continue the unfinished task.
+   - `blocked`: keep the page for the user; do not bypass login, CAPTCHA, or
+     throttling.
+   - `unknown_effect`: first verify whether the previous write already took
+     effect. Never repeat a mutation blindly.
+6. After takeover, use the ordinary Browser Harness helpers and domain-skills.
+   The page is the same targetId, with its form state, scroll position, cookies
+   and login preserved.
+
+The default `BH_BROWSER_BACKEND=auto` uses DoraBox's existing Chrome extension
+authorization when available, avoiding a second remote-debugging permission
+flow. Explicit Browser Use Cloud or `BU_CDP_*` settings still take precedence.
+\n## Usage\n
 ```bash
 browser-harness <<'PY'
 print(page_info())
@@ -41,7 +67,7 @@ PY
   scroll once, then re-read the scroll position. This visibly switches tabs,
   so do not use it when the user has forbidden foreground changes. Do not
   invent a `Runtime.evaluate` scroll replacement or a cross-frame JS walker.
-- The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
+- With `BH_BROWSER_BACKEND=auto` (default), a connected DoraBox Browser Bridge is used first; otherwise the official local Chrome CDP flow remains unchanged.
 
 ## Local Chrome
 

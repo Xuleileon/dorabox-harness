@@ -80,6 +80,24 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 def drain_events():  return _send({"meta": "drain_events"})["events"]
 
 
+def adopt_dorabox_handoff(handoff_id=None):
+    """Adopt a failed DoraBox adapter's exact tab in the running daemon.
+
+    Returns the handoff record plus the attached target/session. Respect its
+    ``safety`` field before taking another action.
+    """
+    req = {"meta": "dorabox_handoff"}
+    if handoff_id:
+        req["handoff_id"] = handoff_id
+    return _send(req, response_timeout=30.0)
+
+
+def release_dorabox_handoff():
+    """Release the currently claimed DoraBox handoff, if any."""
+    return _send({"meta": "dorabox_handoff_release"}, response_timeout=15.0)
+
+
+
 def _js_snippet(expression, limit=160):
     snippet = expression.strip().replace("\n", "\\n")
     return snippet[:limit - 3] + "..." if len(snippet) > limit else snippet
